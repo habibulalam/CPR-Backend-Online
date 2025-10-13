@@ -35,6 +35,10 @@ const connectDB = async () => {
   }
 };
 
+app.get("/", async(req,res) => {
+  res.status(200).send("Code is running")
+})
+
 // ------------------------------------------------------- Login Related Code Start------------------------------------------
 // POST API to check login credentials
 app.post('/api/login', async (req, res) => {
