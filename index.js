@@ -22,12 +22,13 @@ app.use(express.json());
 const connectDB = async () => {
   try {
     // Local DB
-    // await mongoose.connect("mongodb://127.0.0.1:27017/CprBusinessManagement");
-    // console.log("Database is connected to Local Database");
+    await mongoose.connect("mongodb://127.0.0.1:27017/CprBusinessManagement");
+    console.log("Database is connected to Local Database");
 
     // Online DD
-    await mongoose.connect(process.env.MONGO_URI);
-    console.log("Database is connected to Online Database");
+    // await mongoose.connect(process.env.MONGO_URI);
+    // console.log("Database is connected to Online Database");
+
   } catch (error) {
     console.log("Database is not Connected");
     console.log(error.message);
@@ -35,7 +36,7 @@ const connectDB = async () => {
   }
 };
 
-app.get("/", async(req,res) => {
+app.get("/", async (req, res) => {
   res.status(200).send("Code is running")
 })
 
@@ -85,6 +86,7 @@ app.get('/api/branches', async (req, res) => {
     const branches = await Branch.find();
     res.status(200).json(branches);
   } catch (error) {
+    console.log(error);
     res.status(500).json({ message: 'Error fetching branches', error: error.message });
   }
 });
@@ -657,6 +659,225 @@ app.put('/api/deactivateGuarantee/:id', async (req, res) => {
   }
 });
 // ============================================= Put guarantee only for DEACTIVATING guarantee (End)=======================================
+
+
+
+
+
+// =============================================
+// Daily Final Report (Manager)
+// =============================================
+
+const BD_OFFSET_MS_2 = 6 * 60 * 60 * 1000;
+
+app.post('/api/daily-final-report/fetch', async (req, res) => {
+  try {
+    const {
+      managerId,
+      managerEmail,
+      branchId,
+      branchName,
+      dateInfo
+    } = req.body;
+    // console.log(req.body);
+
+    if (!branchId || !dateInfo?.date) {
+      return res.status(400).json({ message: 'branchId and dateInfo.date are required' });
+    }
+
+    // ----------------------------
+    // 1) Build BD day range safely
+    // ----------------------------
+    // dateInfo.date = "YYYY-MM-DD" (BD date from frontend)
+    const [year, month, day] = dateInfo.date.split('-').map(Number);
+
+    // BD local midnight → convert to UTC
+    const startUtcMs =
+      Date.UTC(year, month - 1, day, 0, 0, 0, 0) - BD_OFFSET_MS_2;
+
+    const endUtcMs =
+      Date.UTC(year, month - 1, day, 23, 59, 59, 999) - BD_OFFSET_MS_2;
+
+    const start = new Date(startUtcMs);
+    const end = new Date(endUtcMs);
+
+    // ----------------------------
+    // 2) Branch filter (string / ObjectId safe)
+    // ----------------------------
+    let branchObjectId = null;
+    try {
+      branchObjectId = mongoose.Types.ObjectId(branchId);
+    } catch (_) { }
+
+    const branchFilter = branchObjectId
+      ? {
+        $or: [
+          { 'meta.branchId': branchObjectId },
+          { 'meta.branchId': String(branchId) },
+          { branchId: branchObjectId },
+          { branchId: String(branchId) }
+        ]
+      }
+      : {
+        $or: [
+          { 'meta.branchId': String(branchId) },
+          { branchId: String(branchId) }
+        ]
+      };
+
+    // ----------------------------
+    // 3) Fetch DailyCustomerData
+    // ----------------------------
+    const dailyDocs = await DailyCustomerData.find({
+      $and: [
+        branchFilter,
+        {
+          $or: [
+            { 'meta.createdAt': { $gte: start, $lte: end } },
+            { createdAt: { $gte: start, $lte: end } }
+          ]
+        }
+      ]
+    }).lean();
+
+    // ----------------------------
+    // 4) Aggregations
+    // ----------------------------
+    const staffMap = {};
+    const machineMap = {};
+    const brandMap = {};
+    let totalExpenses = 0;
+    let partsIncome = 0;
+
+    dailyDocs.forEach(doc => {
+      // ---- Staff summary ----
+      const staffId = doc.meta?.staffId;
+      if (staffId) {
+        if (!staffMap[staffId]) {
+          staffMap[staffId] = {
+            staffId,
+            name: doc.meta?.staffName || 'Unknown',
+            totalCustomers: 0,
+            totalEarnings: 0,
+            salaryPercent: doc.meta?.salaryPercent || 0,
+            salaryAmount: 0,
+            netPay: 0
+          };
+        }
+
+        staffMap[staffId].totalCustomers += 1;
+        staffMap[staffId].totalEarnings += doc.summary?.netTotalCollected || 0;
+      }
+
+      // ---- Machine / service ----
+      doc.problems?.forEach(p => {
+        const name = p.workPart || 'Unknown Service';
+        if (!machineMap[name]) {
+          machineMap[name] = { name, count: 0, totalAmount: 0 };
+        }
+        machineMap[name].count += 1;
+        machineMap[name].totalAmount += p.amounts?.baseAmount || 0;
+
+        // parts income
+        if (p.extraPart?.used) {
+          partsIncome += Number(p.extraPart.partCost || 0);
+        }
+      });
+
+      // ---- Brand count ----
+      const brand = doc.device?.brand;
+      if (brand) {
+        brandMap[brand] = (brandMap[brand] || 0) + 1;
+      }
+
+      // ---- Expenses ----
+      if (Array.isArray(doc.expenses)) {
+        doc.expenses.forEach(e => {
+          totalExpenses += Number(e.amount || 0);
+        });
+      }
+    });
+
+    // ----------------------------
+    // 5) Staff salary calculation
+    // ----------------------------
+    const staff = Object.values(staffMap).map(s => {
+      s.salaryAmount = Math.round((s.totalEarnings * s.salaryPercent) / 100);
+      s.netPay = s.totalEarnings - s.salaryAmount;
+      return s;
+    });
+
+    // ----------------------------
+    // 6) Guarantee summary
+    // ----------------------------
+    const guarantees = await Guarantee.find({
+      'meta.branchId': String(branchId),
+      'meta.createdAt': { $gte: start, $lte: end }
+    }).lean();
+
+    let guaranteeTotal = 0;
+    let demurrageTotal = 0;
+
+    guarantees.forEach(g => {
+      guaranteeTotal += Number(g.guarantee?.amount || 0);
+      if (!g.isActive) {
+        demurrageTotal += Number(g.guarantee?.amount || 0);
+      }
+    });
+
+    // ----------------------------
+    // 7) Final totals
+    // ----------------------------
+    const totalStaffEarnings = staff.reduce((a, s) => a + s.totalEarnings, 0);
+    const totalMachineIncome = Object.values(machineMap)
+      .reduce((a, m) => a + m.totalAmount, 0);
+
+    const netIncome =
+      totalStaffEarnings +
+      totalMachineIncome +
+      partsIncome -
+      (totalExpenses + demurrageTotal);
+
+    // ----------------------------
+    // 8) Final response
+    // ----------------------------
+    return res.json({
+      meta: {
+        date: dateInfo.date,
+        managerId,
+        managerEmail,
+        branchId,
+        branchName
+      },
+      staff,
+      machines: Object.values(machineMap),
+      expenses: [], // optional: you can expand later
+      guarantee: {
+        guaranteeTotal,
+        demurrageTotal
+      },
+      brands: Object.entries(brandMap).map(([brand, count]) => ({
+        brand,
+        count
+      })),
+      totals: {
+        totalStaffEarnings,
+        totalMachineIncome,
+        totalExpenses,
+        partsIncome,
+        netIncome
+      }
+    });
+
+  } catch (err) {
+    console.error('Daily final report error:', err);
+    return res.status(500).json({ message: 'Server error generating report' });
+  }
+});
+
+
+
+
 
 
 // Start the server
