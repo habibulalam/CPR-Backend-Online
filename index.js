@@ -661,11 +661,8 @@ app.put('/api/deactivateGuarantee/:id', async (req, res) => {
 // ============================================= Put guarantee only for DEACTIVATING guarantee (End)=======================================
 
 
-
-
-
 // =============================================
-// Daily Final Report (Manager)
+// Daily Final Report (Manager) - STAFF FIXED
 // =============================================
 
 const BD_OFFSET_MS_2 = 6 * 60 * 60 * 1000;
@@ -679,19 +676,16 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
       branchName,
       dateInfo
     } = req.body;
-    // console.log(req.body);
 
     if (!branchId || !dateInfo?.date) {
       return res.status(400).json({ message: 'branchId and dateInfo.date are required' });
     }
 
-    // ----------------------------
-    // 1) Build BD day range safely
-    // ----------------------------
-    // dateInfo.date = "YYYY-MM-DD" (BD date from frontend)
+    // ------------------------------------------------
+    // 1) Build Bangladesh day range (SAFE)
+    // ------------------------------------------------
     const [year, month, day] = dateInfo.date.split('-').map(Number);
 
-    // BD local midnight → convert to UTC
     const startUtcMs =
       Date.UTC(year, month - 1, day, 0, 0, 0, 0) - BD_OFFSET_MS_2;
 
@@ -701,33 +695,33 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
     const start = new Date(startUtcMs);
     const end = new Date(endUtcMs);
 
-    // ----------------------------
-    // 2) Branch filter (string / ObjectId safe)
-    // ----------------------------
+    // ------------------------------------------------
+    // 2) Branch filter (ObjectId + string safe)
+    // ------------------------------------------------
     let branchObjectId = null;
     try {
       branchObjectId = mongoose.Types.ObjectId(branchId);
-    } catch (_) { }
+    } catch (_) {}
 
     const branchFilter = branchObjectId
       ? {
-        $or: [
-          { 'meta.branchId': branchObjectId },
-          { 'meta.branchId': String(branchId) },
-          { branchId: branchObjectId },
-          { branchId: String(branchId) }
-        ]
-      }
+          $or: [
+            { 'meta.branchId': branchObjectId },
+            { 'meta.branchId': String(branchId) },
+            { branchId: branchObjectId },
+            { branchId: String(branchId) }
+          ]
+        }
       : {
-        $or: [
-          { 'meta.branchId': String(branchId) },
-          { branchId: String(branchId) }
-        ]
-      };
+          $or: [
+            { 'meta.branchId': String(branchId) },
+            { branchId: String(branchId) }
+          ]
+        };
 
-    // ----------------------------
+    // ------------------------------------------------
     // 3) Fetch DailyCustomerData
-    // ----------------------------
+    // ------------------------------------------------
     const dailyDocs = await DailyCustomerData.find({
       $and: [
         branchFilter,
@@ -740,9 +734,9 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
       ]
     }).lean();
 
-    // ----------------------------
-    // 4) Aggregations
-    // ----------------------------
+    // ------------------------------------------------
+    // 4) Aggregation (STAFF BASIC DATA ONLY)
+    // ------------------------------------------------
     const staffMap = {};
     const machineMap = {};
     const brandMap = {};
@@ -750,26 +744,28 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
     let partsIncome = 0;
 
     dailyDocs.forEach(doc => {
-      // ---- Staff summary ----
+      // -------- STAFF SUMMARY (NO NAME, NO SALARY HERE)
       const staffId = doc.meta?.staffId;
       if (staffId) {
-        if (!staffMap[staffId]) {
-          staffMap[staffId] = {
-            staffId,
-            name: doc.meta?.staffName || 'Unknown',
+        const key = String(staffId);
+
+        if (!staffMap[key]) {
+          staffMap[key] = {
+            staffId: key,
             totalCustomers: 0,
             totalEarnings: 0,
-            salaryPercent: doc.meta?.salaryPercent || 0,
+            salaryPercent: 0,
             salaryAmount: 0,
-            netPay: 0
+            netPay: 0,
+            name: 'Unknown'
           };
         }
 
-        staffMap[staffId].totalCustomers += 1;
-        staffMap[staffId].totalEarnings += doc.summary?.netTotalCollected || 0;
+        staffMap[key].totalCustomers += 1;
+        staffMap[key].totalEarnings += doc.summary?.netTotalCollected || 0;
       }
 
-      // ---- Machine / service ----
+      // -------- MACHINE / SERVICE (unchanged)
       doc.problems?.forEach(p => {
         const name = p.workPart || 'Unknown Service';
         if (!machineMap[name]) {
@@ -778,19 +774,18 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
         machineMap[name].count += 1;
         machineMap[name].totalAmount += p.amounts?.baseAmount || 0;
 
-        // parts income
         if (p.extraPart?.used) {
           partsIncome += Number(p.extraPart.partCost || 0);
         }
       });
 
-      // ---- Brand count ----
+      // -------- BRAND COUNT
       const brand = doc.device?.brand;
       if (brand) {
         brandMap[brand] = (brandMap[brand] || 0) + 1;
       }
 
-      // ---- Expenses ----
+      // -------- EXPENSES
       if (Array.isArray(doc.expenses)) {
         doc.expenses.forEach(e => {
           totalExpenses += Number(e.amount || 0);
@@ -798,18 +793,46 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
       }
     });
 
-    // ----------------------------
-    // 5) Staff salary calculation
-    // ----------------------------
+    // ------------------------------------------------
+    // 5) FETCH STAFF INFOS USING staffIds
+    // ------------------------------------------------
+    const staffIds = Object.keys(staffMap);
+
+    const staffInfos = await StaffInfo.find({
+      _id: { $in: staffIds }
+    }).lean();
+
+    // ------------------------------------------------
+    // 6) Build staffInfo lookup map
+    // ------------------------------------------------
+    const staffInfoMap = {};
+    staffInfos.forEach(s => {
+      staffInfoMap[String(s._id)] = {
+        name: s.name,
+        salaryPercentage: s.salaryPercentage || 0
+      };
+    });
+
+    // ------------------------------------------------
+    // 7) Merge staffInfos + Salary Calculation
+    // ------------------------------------------------
     const staff = Object.values(staffMap).map(s => {
-      s.salaryAmount = Math.round((s.totalEarnings * s.salaryPercent) / 100);
+      const info = staffInfoMap[s.staffId];
+
+      s.name = info?.name || 'Unknown';
+      s.salaryPercent = info?.salaryPercentage || 0;
+
+      s.salaryAmount = Math.round(
+        (s.totalEarnings * s.salaryPercent) / 100
+      );
+
       s.netPay = s.totalEarnings - s.salaryAmount;
       return s;
     });
 
-    // ----------------------------
-    // 6) Guarantee summary
-    // ----------------------------
+    // ------------------------------------------------
+    // 8) Guarantee summary (unchanged)
+    // ------------------------------------------------
     const guarantees = await Guarantee.find({
       'meta.branchId': String(branchId),
       'meta.createdAt': { $gte: start, $lte: end }
@@ -825,9 +848,9 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
       }
     });
 
-    // ----------------------------
-    // 7) Final totals
-    // ----------------------------
+    // ------------------------------------------------
+    // 9) Final totals
+    // ------------------------------------------------
     const totalStaffEarnings = staff.reduce((a, s) => a + s.totalEarnings, 0);
     const totalMachineIncome = Object.values(machineMap)
       .reduce((a, m) => a + m.totalAmount, 0);
@@ -838,9 +861,9 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
       partsIncome -
       (totalExpenses + demurrageTotal);
 
-    // ----------------------------
-    // 8) Final response
-    // ----------------------------
+    // ------------------------------------------------
+    // 10) Final response
+    // ------------------------------------------------
     return res.json({
       meta: {
         date: dateInfo.date,
@@ -851,7 +874,7 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
       },
       staff,
       machines: Object.values(machineMap),
-      expenses: [], // optional: you can expand later
+      expenses: [],
       guarantee: {
         guaranteeTotal,
         demurrageTotal
@@ -874,8 +897,6 @@ app.post('/api/daily-final-report/fetch', async (req, res) => {
     return res.status(500).json({ message: 'Server error generating report' });
   }
 });
-
-
 
 
 
